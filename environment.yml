@@ -1,0 +1,30 @@
+name: dg
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch>=2.1.0
+  - torchvision
+  - pytorch-cuda=11.8        # A100/RTX3090；如用CPU请删除此行
+  - cudatoolkit=11.8
+  - numpy>=1.24
+  - pandas>=2.0
+  - scipy>=1.11
+  - scikit-learn>=1.3
+  - matplotlib>=3.7
+  - seaborn>=0.12
+  - tqdm>=4.65
+  - pyyaml>=6.0
+  - omegaconf>=2.3           # yaml层级配置管理
+  - hydra-core>=1.3          # 实验配置调度
+  - pip
+  - pip:
+    - wandb>=0.16            # 实验追踪
+    - einops>=0.7            # tensor维度操作
+    - tensorboard>=2.14
+    - pytest>=7.4
+    - black>=23.0
+    - isort>=5.12

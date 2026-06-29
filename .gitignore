@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# v
+.env
+.venv
+env/
+
+# dataset
+data/raw/
+data/processed/
+data/splits/
+
+# models
+outputs/
+logs/
+wandb/
+*.ckpt
+*.pth
+*.pt
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.DS_Store
