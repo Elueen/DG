@@ -32,3 +32,8 @@ notebooks/.ipynb_checkpoints/
 .idea/
 .vscode/
 *.DS_Store
+
+# SLURM logs & job outputs
+slurm/logs/
+slurm/*.out
+slurm/*.err
