@@ -47,6 +47,9 @@ X_CANDIDATES = ["x", "X", "local_x", "Local_X"]
 Y_CANDIDATES = ["y", "Y", "local_y", "Local_Y"]
 XVEL_CANDIDATES = ["xVelocity", "vx", "v_x"]
 YVEL_CANDIDATES = ["yVelocity", "vy", "v_y"]
+# 合速度标量（部分NGSIM半转换文件只有合速度，没有x/y分量）
+# 用于物理一致性频率反推时的备用速度字段
+SCALAR_VEL_CANDIDATES = ["v_Vel", "v_vel", "speed", "velocity", "v_Speed"]
 
 # 候选频率集合：用于物理一致性反推时遍历测试
 CANDIDATE_FREQUENCIES_HZ = [10.0, 25.0, 30.0, 50.0]
@@ -151,6 +154,20 @@ def detect_sampling_frequency(
             yc = y_col or _find_column(df, Y_CANDIDATES)
             xvc = xvel_col or _find_column(df, XVEL_CANDIDATES)
             yvc = yvel_col or _find_column(df, YVEL_CANDIDATES)
+
+            # 回退：如果没有 xVelocity 分量，尝试用合速度标量 v_Vel 替代
+            # 原理：对于高速公路直行车辆，横向速度远小于纵向速度，
+            # v_Vel ≈ |vx|，用 dx/dt 与 v_Vel 做比值检验仍然有效
+            # （比值偏离1.0时的倍数关系与用xVelocity完全相同，频率判断不受影响）
+            scalar_vel_col = None
+            if xvc is None:
+                scalar_vel_col = _find_column(df, SCALAR_VEL_CANDIDATES)
+                if scalar_vel_col is not None:
+                    logger.info(
+                        f"未找到 xVelocity 分量列，改用合速度标量列 '{scalar_vel_col}' "
+                        f"做物理一致性反推（高速公路场景下 v_Vel ≈ |vx|，结果可靠）"
+                    )
+                    xvc = scalar_vel_col  # 临时复用 xvc 槽位，传入反推函数
 
             if xc is not None and xvc is not None:
                 logger.info(
@@ -562,8 +579,51 @@ def smooth_positions(
         x_vals = df.loc[idx, x_col].to_numpy(dtype=np.float64)
         y_vals = df.loc[idx, y_col].to_numpy(dtype=np.float64)
 
-        x_smooth = savgol_filter(x_vals, window_length=local_window, polyorder=local_polyorder)
-        y_smooth = savgol_filter(y_vals, window_length=local_window, polyorder=local_polyorder)
+        # ---- 数值合法性检查（防止脏数据导致savgol SVD不收敛）----
+        # 三种情况会让SG滤波的最小二乘内核崩溃：
+        #   1. NaN/Inf：矩阵元素非法
+        #   2. 全常数序列：秩亏，lstsq无法收敛
+        #   3. 数值量级极端（>1e10）：浮点溢出
+        def _is_safe_for_savgol(arr: np.ndarray) -> tuple[bool, str]:
+            if not np.all(np.isfinite(arr)):
+                return False, f"含NaN/Inf（共{(~np.isfinite(arr)).sum()}个）"
+            if np.all(arr == arr[0]):
+                return False, "全部相同值（常数序列，矩阵秩亏）"
+            if np.max(np.abs(arr)) > 1e10:
+                return False, f"数值量级过大（最大绝对值={np.max(np.abs(arr)):.2e}）"
+            return True, ""
+
+        x_ok, x_reason = _is_safe_for_savgol(x_vals)
+        y_ok, y_reason = _is_safe_for_savgol(y_vals)
+
+        if not x_ok or not y_ok:
+            df.loc[idx, "x_smooth"] = x_vals
+            df.loc[idx, "y_smooth"] = y_vals
+            reasons = []
+            if not x_ok:
+                reasons.append(f"x列: {x_reason}")
+            if not y_ok:
+                reasons.append(f"y列: {y_reason}")
+            logger.warning(
+                f"车辆 {vid}（{n_frames}帧）跳过平滑，原因: {'; '.join(reasons)}。"
+                f"该车辆保留原始位置值，不影响其他车辆。"
+            )
+            n_vehicles_too_short += 1
+            continue
+
+        try:
+            x_smooth = savgol_filter(x_vals, window_length=local_window, polyorder=local_polyorder)
+            y_smooth = savgol_filter(y_vals, window_length=local_window, polyorder=local_polyorder)
+        except Exception as e:
+            # 兜底：通过检查后仍可能失败（极端边界情况），保留原始值不中断整个文件
+            df.loc[idx, "x_smooth"] = x_vals
+            df.loc[idx, "y_smooth"] = y_vals
+            logger.warning(
+                f"车辆 {vid}（{n_frames}帧）savgol_filter 异常（{type(e).__name__}: {e}），"
+                f"已回退到原始值，不影响其他车辆。"
+            )
+            n_vehicles_too_short += 1
+            continue
 
         df.loc[idx, "x_smooth"] = x_smooth
         df.loc[idx, "y_smooth"] = y_smooth
@@ -611,12 +671,19 @@ def _diagnose_smoothing_effect(
         idx = group_idx
         if len(idx) < 4:  # 至少要能算二阶差分
             continue
-        n_vehicles += 1
 
         x_raw = df.loc[idx, x_col].to_numpy(dtype=np.float64)
         y_raw = df.loc[idx, y_col].to_numpy(dtype=np.float64)
         x_sm = df.loc[idx, "x_smooth"].to_numpy(dtype=np.float64)
         y_sm = df.loc[idx, "y_smooth"].to_numpy(dtype=np.float64)
+
+        # 跳过含NaN/Inf的车辆（包括平滑时被标记为脏数据、原值回退的车辆）
+        # 这些车辆不参与诊断统计，避免nan污染整体结果
+        if not (np.all(np.isfinite(x_raw)) and np.all(np.isfinite(y_raw))
+                and np.all(np.isfinite(x_sm)) and np.all(np.isfinite(y_sm))):
+            continue
+
+        n_vehicles += 1
 
         vx_b = np.diff(x_raw) / dt
         vy_b = np.diff(y_raw) / dt
@@ -907,6 +974,22 @@ def run_smoothing_and_downsampling_pipeline(
         vehicle_id_col=vehicle_id_col,
         frame_col=frame_col,
     )
+
+    # Step 4: 列结构标准化
+    # 确保输出 parquet 统一包含 xVelocity / yVelocity 列，
+    # 对于只有合速度标量 v_Vel 的 NGSIM 半转换文件，用重新差分的结果填充。
+    # 这样后续 Dataset.__getitem__ 只需要认识 xVelocity/yVelocity，
+    # 不需要再处理两种列名格式的分支逻辑。
+    if "xVelocity" not in df_final.columns:
+        df_final["xVelocity"] = df_final["vx_recomputed"]
+        df_final["yVelocity"] = df_final["vy_recomputed"]
+        logger.info(
+            "原始数据无 xVelocity/yVelocity 列（NGSIM半转换格式），"
+            "已用平滑位置差分结果填充，列结构已与highD格式对齐。"
+        )
+    if "xAcceleration" not in df_final.columns:
+        df_final["xAcceleration"] = df_final["ax_recomputed"]
+        df_final["yAcceleration"] = df_final["ay_recomputed"]
 
     avg_velocity_reduction = float(np.mean([
         (smoothing_diag.vx_std_before - smoothing_diag.vx_std_after) / max(smoothing_diag.vx_std_before, 1e-8),
